@@ -24,6 +24,37 @@
 
 // intervalo entre interrupções do relógio
 #define INTERVALO_INTERRUPCAO 50   // em instruções executadas
+#define MAX_PROC 16
+
+typedef enum { P_MORTO=0, P_PRONTO=1, P_EXEC=2 } p_estado_t;
+
+typedef struct {
+  int pid;
+  p_estado_t estado;
+  // registradores salvos
+  int A, X, PC, ERRO;
+  // terminal "base" para E/S (A/B/C/D) em forma de enum de dispositivos
+  int term_base; // D_TERM_A / D_TERM_B / D_TERM_C / D_TERM_D
+  bool em_uso;
+} pcb_t;
+
+static int pid_next = 1;
+
+
+static int escolhe_term_base_por_pid(int pid) {
+  int s = (pid-1) % 4;
+  switch (s) {
+    case 0: return D_TERM_A;
+    case 1: return D_TERM_B;
+    case 2: return D_TERM_C;
+    default: return D_TERM_D;
+  }
+}
+
+static int dev_teclado_ok(int base)   { return base + TERM_TECLADO_OK; }
+static int dev_teclado(int base)      { return base + TERM_TECLADO; }
+static int dev_tela_ok(int base)      { return base + TERM_TELA_OK; }
+static int dev_tela(int base)         { return base + TERM_TELA; }
 
 struct so_t {
   cpu_t *cpu;
@@ -34,6 +65,10 @@ struct so_t {
 
   int regA, regX, regPC, regERRO; // cópia do estado da CPU
   // t2: tabela de processos, processo corrente, pendências, etc
+    // ---- Parte I: tabela de processos e escalonador simples
+  pcb_t proc[MAX_PROC];
+  int   idx_atual;   // índice na tabela do processo em execução, -1 se nenhum
+  int   n_procs;     // quantidade de entradas em uso
 };
 
 
@@ -65,6 +100,20 @@ so_t *so_cria(cpu_t *cpu, mem_t *mem, es_t *es, console_t *console)
   // quando a CPU executar uma instrução CHAMAC, deve chamar a função
   //   so_trata_interrupcao, com primeiro argumento um ptr para o SO
   cpu_define_chamaC(self->cpu, so_trata_interrupcao, self);
+
+  // ---- init T2: tabela de processos
+  self->idx_atual = -1;
+  self->n_procs = 0;
+  for (int i = 0; i < MAX_PROC; i++) {
+    self->proc[i].em_uso = false;
+    self->proc[i].estado = P_MORTO;
+    self->proc[i].pid = 0;
+    self->proc[i].A = 0;
+    self->proc[i].X = 0;
+    self->proc[i].PC = 0;
+    self->proc[i].ERRO = 0;
+    self->proc[i].term_base = D_TERM_A; // valor default; será definido ao criar
+  }
 
   return self;
 }
@@ -121,17 +170,30 @@ static int so_trata_interrupcao(void *argC, int reg_A)
 
 static void so_salva_estado_da_cpu(so_t *self)
 {
-  // t2: salva os registradores que compõem o estado da cpu no descritor do
-  //   processo corrente. os valores dos registradores foram colocados pela
-  //   CPU na memória, nos endereços CPU_END_PC etc. O registrador X foi salvo
-  //   pelo tratador de interrupção (ver trata_irq.asm) no endereço 59
-  // se não houver processo corrente, não faz nada
-  if (mem_le(self->mem, CPU_END_A, &self->regA) != ERR_OK
-      || mem_le(self->mem, CPU_END_PC, &self->regPC) != ERR_OK
-      || mem_le(self->mem, CPU_END_erro, &self->regERRO) != ERR_OK
-      || mem_le(self->mem, 59, &self->regX)) {
+  // Lê registradores salvos pelo tratador em memória
+  int A, PC, ERRO, X;
+  if (mem_le(self->mem, CPU_END_A, &A) != ERR_OK
+   || mem_le(self->mem, CPU_END_PC, &PC) != ERR_OK
+   || mem_le(self->mem, CPU_END_erro, &ERRO) != ERR_OK
+   || mem_le(self->mem, 59, &X) != ERR_OK) {
     console_printf("SO: erro na leitura dos registradores");
     self->erro_interno = true;
+    return;
+  }
+
+  // Espelha no "snapshot" do SO (usado para id da syscall, mensagens de erro, etc.)
+  self->regA = A;
+  self->regX = X;
+  self->regPC = PC;
+  self->regERRO = ERRO;
+
+  // Se houver processo corrente, salva também no PCB
+  if (self->idx_atual >= 0) {
+    pcb_t *p = &self->proc[self->idx_atual];
+    p->A = A; 
+    p->X = X; 
+    p->PC = PC; 
+    p->ERRO = ERRO;
   }
 }
 
@@ -147,29 +209,60 @@ static void so_trata_pendencias(so_t *self)
 
 static void so_escalona(so_t *self)
 {
-  // escolhe o próximo processo a executar, que passa a ser o processo
-  //   corrente; pode continuar sendo o mesmo de antes ou não
-  // t2: na primeira versão, escolhe um processo pronto caso o processo
-  //   corrente não possa continuar executando, senão deixa o mesmo processo.
-  //   depois, implementa um escalonador melhor
+  // Escalonador simples:
+  // - se há processo atual e ele está PRONTO/EXEC, continua (preferência)
+  // - senão, escolhe o primeiro PRONTO da tabela
+
+  // Normaliza estado do atual: ao entrar no SO por interrupção,
+  // consideramos que ele fica PRONTO (a menos que tenha morrido)
+  if (self->idx_atual >= 0) {
+    if (self->proc[self->idx_atual].estado == P_EXEC)
+      self->proc[self->idx_atual].estado = P_PRONTO;
+  }
+
+  // mantém se ainda pode executar
+  if (self->idx_atual >= 0) {
+    pcb_t *p = &self->proc[self->idx_atual];
+    if (p->em_uso && p->estado == P_PRONTO) {
+      p->estado = P_EXEC;
+      return;
+    }
+  }
+
+  // procura primeiro PRONTO
+  for (int i = 0; i < MAX_PROC; i++) {
+    if (self->proc[i].em_uso && self->proc[i].estado == P_PRONTO) {
+      self->idx_atual = i;
+      self->proc[i].estado = P_EXEC;
+      return;
+    }
+  }
+
+  // nenhum pronto -> sem processo CPU ficará ociosa
+  self->idx_atual = -1;
 }
 
 static int so_despacha(so_t *self)
 {
-  // t2: se houver processo corrente, coloca o estado desse processo onde ele
-  //   será recuperado pela CPU (em CPU_END_PC etc e 59) e retorna 0,
-  //   senão retorna 1
-  // o valor retornado será o valor de retorno de CHAMAC, e será colocado no 
-  //   registrador A para o tratador de interrupção (ver trata_irq.asm).
-  if (mem_escreve(self->mem, CPU_END_A, self->regA) != ERR_OK
-      || mem_escreve(self->mem, CPU_END_PC, self->regPC) != ERR_OK
-      || mem_escreve(self->mem, CPU_END_erro, self->regERRO) != ERR_OK
-      || mem_escreve(self->mem, 59, self->regX)) {
+  // Copia do PCB escolhido para a “área de retorno” que a RETI vai restaurar
+  if (self->idx_atual < 0) {
+    // Sem processo: deixa PC parado no tratador para “girar” (ou poderia saltar p/ BIOS)
+    // Aqui mantemos o estado que já estava.
+    return 0; // valor de retorno de CHAMAC (não usamos)
+  }
+
+  pcb_t *p = &self->proc[self->idx_atual];
+
+  if (mem_escreve(self->mem, CPU_END_A,     p->A)    != ERR_OK
+   || mem_escreve(self->mem, CPU_END_PC,    p->PC)   != ERR_OK
+   || mem_escreve(self->mem, CPU_END_erro,  p->ERRO) != ERR_OK
+   || mem_escreve(self->mem, 59,            p->X)    != ERR_OK) {
     console_printf("SO: erro na escrita dos registradores");
     self->erro_interno = true;
   }
-  if (self->erro_interno) return 1;
-  else return 0;
+
+  // Ao voltar com RETI, a CPU voltará em modo usuário com PC do processo.
+  return 0;
 }
 
 
@@ -209,13 +302,6 @@ static void so_trata_irq(so_t *self, int irq)
 static void so_trata_reset(so_t *self)
 {
   // coloca o tratador de interrupção na memória
-  // quando a CPU aceita uma interrupção, passa para modo supervisor,
-  //   salva seu estado à partir do endereço CPU_END_PC, e desvia para o
-  //   endereço CPU_END_TRATADOR
-  // colocamos no endereço CPU_END_TRATADOR o programa de tratamento
-  //   de interrupção (escrito em asm). esse programa deve conter a
-  //   instrução CHAMAC, que vai chamar so_trata_interrupcao (como
-  //   foi definido na inicialização do SO)
   int ender = so_carrega_programa(self, "trata_int.maq");
   if (ender != CPU_END_TRATADOR) {
     console_printf("SO: problema na carga do programa de tratamento de interrupção");
@@ -228,17 +314,23 @@ static void so_trata_reset(so_t *self)
     self->erro_interno = true;
   }
 
-  // t2: deveria criar um processo para o init, e inicializar o estado do
-  //   processador para esse processo com os registradores zerados, exceto
-  //   o PC e o modo.
-  // como não tem suporte a processos, está carregando os valores dos
-  //   registradores diretamente no estado da CPU mantido pelo SO; daí vai
-  //   copiar para o início da memória pelo despachante, de onde a CPU vai
-  //   carregar para os seus registradores quando executar a instrução RETI
-  //   em bios.asm (que é onde está a instrução CHAMAC que causou a execução
-  //   deste código
+  // --- Parte T2: criar processo init (PID 1) e preparar a tabela de processos
+  // limpa/normaliza a tabela
+  for (int i = 0; i < MAX_PROC; i++) {
+    self->proc[i].em_uso = false;
+    self->proc[i].estado = P_MORTO;
+    self->proc[i].pid = 0;
+    self->proc[i].A = 0;
+    self->proc[i].X = 0;
+    self->proc[i].PC = 0;
+    self->proc[i].ERRO = 0;
+    self->proc[i].term_base = D_TERM_A;
+  }
+  self->n_procs = 0;
+  self->idx_atual = -1;
+  pid_next = 1;
 
-  // coloca o programa init na memória
+  // carrega o init.maq
   ender = so_carrega_programa(self, "init.maq");
   if (ender != 100) {
     console_printf("SO: problema na carga do programa inicial");
@@ -246,8 +338,22 @@ static void so_trata_reset(so_t *self)
     return;
   }
 
-  // altera o PC para o endereço de carga
-  self->regPC = ender; // deveria ser no processo
+  // cria PCB para o init
+  int slot = 0;
+  pcb_t *p = &self->proc[slot];
+  p->em_uso   = true;
+  p->pid      = pid_next++;
+  p->estado   = P_PRONTO;
+  p->A = 0; 
+  p->X = 0; 
+  p->ERRO = 0;
+  p->PC       = ender;              // ponto de entrada do init
+  p->term_base = escolhe_term_base_por_pid(p->pid);
+  self->n_procs = 1;
+
+  // Deixa o escalonador escolher (vai pegar o init agora).
+  // Não escrevemos registradores da CPU diretamente; o despachante cuidará
+  // de carregar o contexto do processo escolhido quando o SO retornar.
 }
 
 // interrupção gerada quando a CPU identifica um erro
@@ -334,113 +440,137 @@ static void so_trata_irq_chamada_sistema(so_t *self)
 // faz a leitura de um dado da entrada corrente do processo, coloca o dado no reg A
 static void so_chamada_le(so_t *self)
 {
-  // implementação com espera ocupada
-  //   t2: deveria realizar a leitura somente se a entrada estiver disponível,
-  //     senão, deveria bloquear o processo.
-  //   no caso de bloqueio do processo, a leitura (e desbloqueio) deverá
-  //     ser feita mais tarde, em tratamentos pendentes em outra interrupção,
-  //     ou diretamente em uma interrupção específica do dispositivo, se for
-  //     o caso
-  // implementação lendo direto do terminal A
-  //   t2: deveria usar dispositivo de entrada corrente do processo
-  for (;;) {  // espera ocupada!
-    int estado;
-    if (es_le(self->es, D_TERM_A_TECLADO_OK, &estado) != ERR_OK) {
+  // Parte I: ainda com espera ocupada (como no esqueleto),
+  // porém lendo do terminal associado ao processo corrente.
+  if (self->idx_atual < 0) { self->regA = -1; return; }
+  pcb_t *p = &self->proc[self->idx_atual];
+  int base = p->term_base;
+
+  for (;;) {
+    int ok;
+    if (es_le(self->es, dev_teclado_ok(base), &ok) != ERR_OK) {
       console_printf("SO: problema no acesso ao estado do teclado");
-      self->erro_interno = true;
-      return;
+      self->erro_interno = true; return;
     }
-    if (estado != 0) break;
-    // como não está saindo do SO, a unidade de controle não está executando seu laço.
+    if (ok) break;
+    console_tictac(self->console);     // como não está saindo do SO, a unidade de controle não está executando seu laço.
     // esta gambiarra faz pelo menos a console ser atualizada
     // t2: com a implementação de bloqueio de processo, esta gambiarra não
     //   deve mais existir.
-    console_tictac(self->console);
   }
-  int dado;
-  if (es_le(self->es, D_TERM_A_TECLADO, &dado) != ERR_OK) {
+
+  int ch;
+  if (es_le(self->es, dev_teclado(base), &ch) != ERR_OK) {
     console_printf("SO: problema no acesso ao teclado");
-    self->erro_interno = true;
-    return;
+    self->erro_interno = true; return;
   }
-  // escreve no reg A do processador
-  // (na verdade, na posição onde o processador vai pegar o A quando retornar da int)
-  // t2: se houvesse processo, deveria escrever no reg A do processo
-  // t2: o acesso só deve ser feito nesse momento se for possível; se não, o processo
-  //   é bloqueado, e o acesso só deve ser feito mais tarde (e o processo desbloqueado)
-  self->regA = dado;
+
+  p->A = ch;   // resultado da chamada vai em A do processo
+  self->regA = 0; // retorno da syscall (OK)
 }
 
 // implementação da chamada se sistema SO_ESCR
 // escreve o valor do reg X na saída corrente do processo
 static void so_chamada_escr(so_t *self)
 {
-  // implementação com espera ocupada
-  //   t2: deveria bloquear o processo se dispositivo ocupado
-  // implementação escrevendo direto do terminal A
-  //   t2: deveria usar o dispositivo de saída corrente do processo
+  if (self->idx_atual < 0) { self->regA = -1; return; }
+  pcb_t *p = &self->proc[self->idx_atual];
+  int base = p->term_base;
+  int ch = p->X; // caractere a escrever vem no X do processo
+
   for (;;) {
-    int estado;
-    if (es_le(self->es, D_TERM_A_TELA_OK, &estado) != ERR_OK) {
+    int ok;
+    if (es_le(self->es, dev_tela_ok(base), &ok) != ERR_OK) {
       console_printf("SO: problema no acesso ao estado da tela");
-      self->erro_interno = true;
-      return;
+      self->erro_interno = true; return;
     }
-    if (estado != 0) break;
-    // como não está saindo do SO, a unidade de controle não está executando seu laço.
-    // esta gambiarra faz pelo menos a console ser atualizada
-    // t2: não deve mais existir quando houver suporte a processos, porque o SO não poderá
-    //   executar por muito tempo, permitindo a execução do laço da unidade de controle
+    if (ok) break;
     console_tictac(self->console);
   }
-  int dado;
-  // está lendo o valor de X e escrevendo o de A direto onde o processador colocou/vai pegar
-  // t2: deveria usar os registradores do processo que está realizando a E/S
-  // t2: caso o processo tenha sido bloqueado, esse acesso deve ser realizado em outra execução
-  //   do SO, quando ele verificar que esse acesso já pode ser feito.
-  dado = self->regX;
-  if (es_escreve(self->es, D_TERM_A_TELA, dado) != ERR_OK) {
-    console_printf("SO: problema no acesso à tela");
-    self->erro_interno = true;
-    return;
+
+  if (es_escreve(self->es, dev_tela(base), ch) != ERR_OK) {
+    console_printf("SO: problema na escrita na tela");
+    self->erro_interno = true; return;
   }
-  self->regA = 0;
+
+  self->regA = 0; // OK
 }
 
 // implementação da chamada se sistema SO_CRIA_PROC
 // cria um processo
 static void so_chamada_cria_proc(so_t *self)
 {
-  // ainda sem suporte a processos, carrega programa e passa a executar ele
-  // quem chamou o sistema não vai mais ser executado, coitado!
-  // t2: deveria criar um novo processo
-
-  // em X está o endereço onde está o nome do arquivo
-  int ender_proc;
-  // t2: deveria ler o X do descritor do processo criador
-  ender_proc = self->regX;
-  char nome[100];
-  if (copia_str_da_mem(100, nome, self->mem, ender_proc)) {
-    int ender_carga = so_carrega_programa(self, nome);
-    if (ender_carga > 0) {
-      // t2: deveria escrever no PC do descritor do processo criado
-      self->regPC = ender_carga;
-      return;
-    } // else?
+  // precisa ter um processo em execução (o chamador)
+  if (self->idx_atual < 0) { 
+    self->regA = -1; 
+    return; 
   }
-  // deveria escrever -1 (se erro) ou o PID do processo criado (se OK) no reg A
-  //   do processo que pediu a criação
-  self->regA = -1;
+
+  pcb_t *pai = &self->proc[self->idx_atual];
+
+  // lê a string com o nome do executável a partir do endereço em X do chamador
+  char nome[128];
+  if (!copia_str_da_mem(sizeof(nome), nome, self->mem, pai->X)) {
+    // endereço inválido, sem '\0' no limite, etc.
+    self->regA = -2;
+    return;
+  }
+
+  // carrega o programa .maq e obtém o ponto de entrada (PC inicial)
+  int pc_inicio = so_carrega_programa(self, nome);
+  if (pc_inicio < 0) {
+    // erro na carga (nome inválido, arquivo inexistente, erro de montagem, ...)
+    self->regA = -3;
+    return;
+  }
+
+  // encontra um slot livre na tabela de processos
+  int slot = -1;
+  for (int i = 0; i < MAX_PROC; i++) {
+    if (!self->proc[i].em_uso) { slot = i; break; }
+  }
+  if (slot < 0) {
+    self->regA = -4; // sem espaço
+    return;
+  }
+
+  // inicializa PCB do novo processo
+  pcb_t *p = &self->proc[slot];
+  p->em_uso   = true;
+  p->pid      = pid_next++;
+  p->estado   = P_PRONTO;
+  p->A        = 0;
+  p->X        = 0;
+  p->ERRO     = 0;
+  p->PC       = pc_inicio;
+  p->term_base = escolhe_term_base_por_pid(p->pid);
+
+  self->n_procs++;
+
+  // retorna o pid do processo criado no registrador A da syscall
+  self->regA = p->pid;
 }
 
 // implementação da chamada se sistema SO_MATA_PROC
 // mata o processo com pid X (ou o processo corrente se X é 0)
 static void so_chamada_mata_proc(so_t *self)
 {
-  // t2: deveria matar um processo
-  // ainda sem suporte a processos, retorna erro -1
-  console_printf("SO: SO_MATA_PROC não implementada");
-  self->regA = -1;
+  if (self->idx_atual < 0) { self->regA = -1; return; }
+
+  int alvo_pid = self->proc[self->idx_atual].X; // pid em X (0 = próprio)
+  if (alvo_pid == 0) alvo_pid = self->proc[self->idx_atual].pid;
+
+  int slot = -1;
+  for (int i = 0; i < MAX_PROC; i++) {
+    if (self->proc[i].em_uso && self->proc[i].pid == alvo_pid) { slot = i; break; }
+  }
+  if (slot < 0) { self->regA = -2; return; }
+
+  self->proc[slot].estado = P_MORTO;
+  self->proc[slot].em_uso = false;
+  self->n_procs--;
+  if (slot == self->idx_atual) self->idx_atual = -1; // será reescalonado
+  self->regA = 0;
 }
 
 // implementação da chamada se sistema SO_ESPERA_PROC
