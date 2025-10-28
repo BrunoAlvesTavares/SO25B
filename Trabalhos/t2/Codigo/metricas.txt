@@ -1,0 +1,19 @@
+=== Relatório de Métricas ===
+Processos criados: 3
+Tempo total: 3896 instruções
+Tempo ocioso: 393
+Preempções totais: 1751
+
+--- Interrupções ---
+Reset: 1
+Erro de execução: 0
+Chamada de sistema: 462
+E/S: relógio: 3896
+E/S: teclado: 0
+E/S: console: 0
+
+--- Por processo ---
+PID 1: retorno=0, pronto=0, exec=1859, bloq=0, preemp=65, resp_med=0.00
+PID 2: retorno=-1004, pronto=0, exec=674, bloq=0, preemp=928, resp_med=0.00
+PID 3: retorno=-1069, pronto=0, exec=907, bloq=0, preemp=305, resp_med=0.00
+PID 4: retorno=-1180, pronto=0, exec=2, bloq=0, preemp=453, resp_med=0.00
